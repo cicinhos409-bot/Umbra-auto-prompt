@@ -4,8 +4,6 @@ import os
 import random
 import re
 
-from .db import IMG_DIR
-
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 MOCK = os.environ.get("MOCK_LLM") == "1"
 
@@ -35,18 +33,20 @@ Rules:
 
 
 def _images_content(product: dict, limit: int = 3):
+    from .db import db
+    names = json.loads(product.get("images") or "[]")[:limit]
+    if not names:
+        return []
+    with db() as c:
+        rows = {r["id"]: r for r in c.execute(
+            "SELECT id, content_type, data FROM images WHERE id = ANY(?)", (names,)).fetchall()}
     blocks = []
-    for name in json.loads(product.get("images") or "[]")[:limit]:
-        path = os.path.join(IMG_DIR, os.path.basename(name))
-        if not os.path.isfile(path):
+    for n in names:
+        r = rows.get(n)
+        if not r:
             continue
-        ext = path.rsplit(".", 1)[-1].lower()
-        media = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(ext)
-        if not media:
-            continue
-        with open(path, "rb") as f:
-            data = base64.standard_b64encode(f.read()).decode()
-        blocks.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
+        data = base64.standard_b64encode(bytes(r["data"])).decode()
+        blocks.append({"type": "image", "source": {"type": "base64", "media_type": r["content_type"], "data": data}})
     return blocks
 
 

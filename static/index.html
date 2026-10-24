@@ -156,7 +156,15 @@ async function saveProduct(id){
   try{ await api(id?'/api/products/'+id:'/api/products',{method:id?'PUT':'POST',body}); toast('salvo'); go('products') }catch(e){toast(e.message,true)}
 }
 async function delProduct(id){ if(confirm('Excluir produto e todos os prompts dele?')){ await api('/api/products/'+id,{method:'DELETE'}); go('products') } }
-async function upImg(id,inp){ const fd=new FormData(); fd.append('file',inp.files[0]); try{ await api(`/api/products/${id}/images`,{method:'POST',body:fd}); vProducts(); refresh() }catch(e){toast(e.message,true)} }
+async function shrink(file){ // reduz p/ no máx. 1600px JPEG (limite de 4,5 MB da Vercel)
+  if(file.size < 1.5*1024*1024 && /jpe?g|webp/.test(file.type)) return file;
+  const bmp = await createImageBitmap(file); const k = Math.min(1, 1600/Math.max(bmp.width,bmp.height));
+  const cv = document.createElement('canvas'); cv.width = Math.round(bmp.width*k); cv.height = Math.round(bmp.height*k);
+  const cx = cv.getContext('2d'); cx.fillStyle='#fff'; cx.fillRect(0,0,cv.width,cv.height); cx.drawImage(bmp,0,0,cv.width,cv.height);
+  const blob = await new Promise(r=>cv.toBlob(r,'image/jpeg',0.86));
+  return new File([blob], (file.name.replace(/\.[^.]+$/,'')||'img')+'.jpg', {type:'image/jpeg'});
+}
+async function upImg(id,inp){ try{ const f = await shrink(inp.files[0]); const fd=new FormData(); fd.append('file',f); await api(`/api/products/${id}/images`,{method:'POST',body:fd}); vProducts(); refresh() }catch(e){toast(e.message,true)} }
 async function delImg(id,n){ await api(`/api/products/${id}/images/${n}`,{method:'DELETE'}); refresh() }
 
 // ---------- Agentes ----------
@@ -172,7 +180,7 @@ async function vJobs(){
     <div class="mut" style="margin-top:4px">última rodada: ${j.last_run||'nunca'}${j.webhook_url?' · webhook: '+esc(j.webhook_url.slice(0,50)):''}</div></div>`).join('')
   || '<div class="card mut">Nenhum agente. Crie um para gerar prompts sozinho.</div>';
 }
-async function runJob(id){ await api(`/api/jobs/${id}/run`,{method:'POST'}); toast('rodando… veja em Prompts / Histórico') }
+async function runJob(id){ toast('gerando… pode levar até 1 min'); try{ const r = await api(`/api/jobs/${id}/run`,{method:'POST'}); toast(r.ok?`pronto: ${r.count} prompt(s)`:`${r.count} prompt(s); ${r.message}`, !r.ok); refresh() }catch(e){toast(e.message,true)} }
 async function toggleJob(id){ const j=jobs.find(x=>x.id===id); await api('/api/jobs/'+id,{method:'PUT',body:{...j,enabled:!j.enabled}}); refresh() }
 function editJob(id){
   const j = jobs.find(x=>x.id===id) || {name:'Novo agente',enabled:false,interval_seconds:600,products_per_run:1,product_ids:[],prompts_per_product:3,seconds_each:7,mode:'separate',language:'en',target_tool:'',style:'',extra:'',max_backlog:30,webhook_url:'',webhook_auth:''};

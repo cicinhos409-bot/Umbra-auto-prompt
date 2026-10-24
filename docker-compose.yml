@@ -1,9 +1,18 @@
 services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: prompts
+      POSTGRES_DB: prompts
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
   prompt-agent:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:prompts@db:5432/prompts
+    depends_on: [db]
     ports:
-      - "127.0.0.1:8000:8000"   # exponha via Caddy/Nginx com HTTPS (veja README)
-    volumes:
-      - ./data:/data
+      - "127.0.0.1:8000:8000"   # exponha via Caddy/Nginx com HTTPS

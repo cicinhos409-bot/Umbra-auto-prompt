@@ -1,0 +1,20 @@
+# Dispara os agentes a cada 5 min (o Cron da Vercel no plano Hobby só roda 1x/dia).
+# Configure em Settings > Secrets and variables > Actions:
+#   secret  TICK_URL  = https://SEU-PROJETO.vercel.app/api/cron/tick
+#   secret  API_KEY   = a mesma API_KEY do projeto na Vercel
+name: tick
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chamar /api/cron/tick
+        env:
+          TICK_URL: ${{ secrets.TICK_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          if [ -z "$TICK_URL" ] || [ -z "$API_KEY" ]; then echo "TICK_URL/API_KEY não configurados; nada a fazer"; exit 0; fi
+          curl -fsS --max-time 290 -X POST -H "X-API-Key: $API_KEY" "$TICK_URL"

@@ -1,49 +1,35 @@
+import hmac
 import json
 import os
 import secrets
 import threading
+import time
 import uuid
-from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from . import db as dbm
-from .db import DATA_DIR, IMG_DIR, db, now
-from .runner import create_batch, run_job
-from .scheduler import start as start_scheduler, sync_jobs
+from .db import db, now
+from .runner import create_batch, run_job, tick
 
 BASE = os.path.dirname(os.path.dirname(__file__))
+MAX_IMAGE = 4 * 1024 * 1024  # Vercel limita o corpo da requisição a ~4,5 MB
 
-
-def _load_api_key() -> str:
-    key = os.environ.get("API_KEY", "").strip()
-    if key:
-        return key
-    path = os.path.join(DATA_DIR, "api_key.txt")
-    if os.path.isfile(path):
-        return open(path).read().strip()
-    key = secrets.token_urlsafe(32)
-    with open(path, "w") as f:
-        f.write(key)
-    print(f"[prompt-agent] API_KEY gerada e salva em {path}: {key}", flush=True)
-    return key
-
-
-API_KEY = _load_api_key()
-
-
-def auth(x_api_key: str | None = Header(default=None)):
-    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
-        raise HTTPException(401, "API key inválida")
+_env_key = os.environ.get("API_KEY", "").strip()
+if not _env_key:
+    # Sem API_KEY: gera uma chave só para esta instância (útil p/ dev local). Em produção defina API_KEY.
+    _env_key = secrets.token_urlsafe(32)
+    print(f"[prompt-agent] API_KEY não definida; chave temporária desta execução: {_env_key}", flush=True)
+API_KEY = _env_key
 
 
 def seed():
     path = os.path.join(BASE, "seed.json")
     with db() as c:
-        if c.execute("SELECT COUNT(*) n FROM products").fetchone()["n"] or not os.path.isfile(path):
+        c.execute("SELECT pg_advisory_xact_lock(7002)")
+        if c.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"] or not os.path.isfile(path):
             return
         data = json.load(open(path, encoding="utf-8"))
         for p in data.get("products", []):
@@ -60,17 +46,45 @@ def seed():
                        j.get("extra", ""), j.get("max_backlog", 30)))
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    dbm.init()
-    seed()
-    start_scheduler()
-    yield
+_ready = False
+_ready_lock = threading.Lock()
 
 
-app = FastAPI(title="Prompt Agent", version="1.0", lifespan=lifespan)
-app.mount("/images", StaticFiles(directory=IMG_DIR), name="images")
-app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="static")
+def ensure_ready():
+    """Cria tabelas e dados iniciais uma vez por instância (cold start)."""
+    global _ready
+    if _ready:
+        return
+    with _ready_lock:
+        if not _ready:
+            dbm.init()
+            seed()
+            _ready = True
+
+
+def auth(x_api_key: str | None = Header(default=None)):
+    if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(401, "API key inválida")
+    try:
+        ensure_ready()
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+app = FastAPI(title="Prompt Agent", version="2.0")
+
+if os.environ.get("RUN_LOCAL_SCHEDULER") == "1":  # só p/ Docker/VPS: a Vercel usa Cron
+    @app.on_event("startup")
+    def _local_ticker():
+        def loop():
+            while True:
+                try:
+                    ensure_ready()
+                    tick()
+                except Exception as e:
+                    print("[ticker]", e, flush=True)
+                time.sleep(15)
+        threading.Thread(target=loop, daemon=True).start()
 
 
 @app.get("/")
@@ -81,7 +95,9 @@ def index():
 @app.get("/api/health")
 def health():
     return {"ok": True, "mock": os.environ.get("MOCK_LLM") == "1",
-            "has_anthropic_key": bool(os.environ.get("ANTHROPIC_API_KEY"))}
+            "has_anthropic_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "has_database": bool(os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")),
+            "has_api_key": bool(os.environ.get("API_KEY"))}
 
 
 # ---------- produtos ----------
@@ -115,10 +131,10 @@ def list_products():
 @app.post("/api/products", dependencies=[Depends(auth)])
 def create_product(p: ProductIn):
     with db() as c:
-        cur = c.execute("INSERT INTO products(name,description,benefits,price,audience,notes,images,active,created_at)"
-                        " VALUES(?,?,?,?,?,?,'[]',?,?)",
-                        (p.name, p.description, p.benefits, p.price, p.audience, p.notes, int(p.active), now()))
-        return _product(c.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone())
+        new_id = c.insert("INSERT INTO products(name,description,benefits,price,audience,notes,images,active,created_at)"
+                          " VALUES(?,?,?,?,?,?,'[]',?,?)",
+                          (p.name, p.description, p.benefits, p.price, p.audience, p.notes, int(p.active), now()))
+        return _product(c.execute("SELECT * FROM products WHERE id=?", (new_id,)).fetchone())
 
 
 @app.put("/api/products/{pid}", dependencies=[Depends(auth)])
@@ -135,52 +151,60 @@ def update_product(pid: int, p: ProductIn):
 @app.delete("/api/products/{pid}", dependencies=[Depends(auth)])
 def delete_product(pid: int):
     with db() as c:
-        r = c.execute("SELECT images FROM products WHERE id=?", (pid,)).fetchone()
-        if not r:
+        if not c.execute("SELECT 1 FROM products WHERE id=?", (pid,)).fetchone():
             raise HTTPException(404, "produto não existe")
-        for name in json.loads(r["images"] or "[]"):
-            try:
-                os.remove(os.path.join(IMG_DIR, os.path.basename(name)))
-            except OSError:
-                pass
-        c.execute("DELETE FROM products WHERE id=?", (pid,))
+        c.execute("DELETE FROM products WHERE id=?", (pid,))  # imagens e prompts saem em cascata
     return {"ok": True}
+
+
+_MEDIA = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
 
 
 @app.post("/api/products/{pid}/images", dependencies=[Depends(auth)])
 async def upload_image(pid: int, file: UploadFile = File(...)):
     ext = (file.filename or "").rsplit(".", 1)[-1].lower()
-    if ext not in ("jpg", "jpeg", "png", "webp"):
+    if ext not in _MEDIA:
         raise HTTPException(400, "use jpg, png ou webp")
     data = await file.read()
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(400, "imagem acima de 5 MB")
+    if len(data) > MAX_IMAGE:
+        raise HTTPException(400, "imagem acima de 4 MB (o painel reduz sozinho; via API envie menor)")
     name = f"{uuid.uuid4().hex}.{ext}"
     with db() as c:
-        r = c.execute("SELECT images FROM products WHERE id=?", (pid,)).fetchone()
+        r = c.execute("SELECT images FROM products WHERE id=? FOR UPDATE", (pid,)).fetchone()
         if not r:
             raise HTTPException(404, "produto não existe")
         imgs = json.loads(r["images"] or "[]") + [name]
-        with open(os.path.join(IMG_DIR, name), "wb") as f:
-            f.write(data)
+        c.execute("INSERT INTO images(id,product_id,content_type,data,created_at) VALUES(?,?,?,?,?)",
+                  (name, pid, _MEDIA[ext], data, now()))
         c.execute("UPDATE products SET images=? WHERE id=?", (json.dumps(imgs), pid))
     return {"images": imgs}
 
 
 @app.delete("/api/products/{pid}/images/{name}", dependencies=[Depends(auth)])
 def delete_image(pid: int, name: str):
-    name = os.path.basename(name)
     with db() as c:
-        r = c.execute("SELECT images FROM products WHERE id=?", (pid,)).fetchone()
+        r = c.execute("SELECT images FROM products WHERE id=? FOR UPDATE", (pid,)).fetchone()
         if not r:
             raise HTTPException(404, "produto não existe")
         imgs = [i for i in json.loads(r["images"] or "[]") if i != name]
         c.execute("UPDATE products SET images=? WHERE id=?", (json.dumps(imgs), pid))
-    try:
-        os.remove(os.path.join(IMG_DIR, name))
-    except OSError:
-        pass
+        c.execute("DELETE FROM images WHERE id=? AND product_id=?", (name, pid))
     return {"images": imgs}
+
+
+@app.get("/images/{name}")
+def get_image(name: str):
+    """Pública (nome é um UUID não adivinhável), para o <img> do painel."""
+    try:
+        ensure_ready()
+        with db() as c:
+            r = c.execute("SELECT content_type, data FROM images WHERE id=?", (name,)).fetchone()
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    if not r:
+        raise HTTPException(404, "imagem não existe")
+    return Response(bytes(r["data"]), media_type=r["content_type"],
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 # ---------- agentes (jobs) ----------
@@ -233,11 +257,10 @@ def list_jobs():
 def create_job(j: JobIn):
     vals = _job_values(j)
     with db() as c:
-        cur = c.execute(f"INSERT INTO jobs(name,enabled,interval_seconds,products_per_run,product_ids,"
-                        f"prompts_per_product,seconds_each,mode,language,target_tool,style,extra,max_backlog,"
-                        f"webhook_url,webhook_auth) VALUES({','.join('?' * 15)})", vals)
-        r = c.execute("SELECT * FROM jobs WHERE id=?", (cur.lastrowid,)).fetchone()
-    sync_jobs()
+        new_id = c.insert(f"INSERT INTO jobs(name,enabled,interval_seconds,products_per_run,product_ids,"
+                          f"prompts_per_product,seconds_each,mode,language,target_tool,style,extra,max_backlog,"
+                          f"webhook_url,webhook_auth) VALUES({','.join('?' * 15)})", vals)
+        r = c.execute("SELECT * FROM jobs WHERE id=?", (new_id,)).fetchone()
     return _job(r)
 
 
@@ -249,7 +272,6 @@ def update_job(jid: int, j: JobIn):
         r = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
     if not r:
         raise HTTPException(404, "agente não existe")
-    sync_jobs()
     return _job(r)
 
 
@@ -257,15 +279,28 @@ def update_job(jid: int, j: JobIn):
 def delete_job(jid: int):
     with db() as c:
         c.execute("DELETE FROM jobs WHERE id=?", (jid,))
-    sync_jobs()
     return {"ok": True}
 
 
 @app.post("/api/jobs/{jid}/run", dependencies=[Depends(auth)])
 def run_job_now(jid: int):
-    """Dispara uma rodada agora, em segundo plano."""
-    threading.Thread(target=run_job, args=(jid,), daemon=True).start()
-    return {"started": True}
+    """Executa uma rodada agora e devolve o resultado (em serverless não há 'segundo plano')."""
+    return run_job(jid)
+
+
+@app.api_route("/api/cron/tick", methods=["GET", "POST"])
+def cron_tick(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)):
+    """Roda os agentes que estão no prazo. Aceita 'Authorization: Bearer CRON_SECRET' (Vercel Cron) ou X-API-Key."""
+    secret = os.environ.get("CRON_SECRET", "")
+    ok = bool(secret and authorization and hmac.compare_digest(authorization, f"Bearer {secret}"))
+    ok = ok or bool(x_api_key and hmac.compare_digest(x_api_key, API_KEY))
+    if not ok:
+        raise HTTPException(401, "não autorizado")
+    try:
+        ensure_ready()
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    return tick()
 
 
 @app.get("/api/runs", dependencies=[Depends(auth)])
@@ -332,9 +367,7 @@ def set_status(prid: int, s: StatusIn):
     return {"ok": True}
 
 
-@app.get("/api/next", dependencies=[Depends(auth)])
-def next_prompt(product_id: int | None = None, job_id: int | None = None, peek: bool = False):
-    """Entrega o prompt 'new' mais antigo e marca como 'used' (use peek=true para só olhar)."""
+def _filters(product_id, job_id):
     where, params = "pr.status='new'", []
     if product_id is not None:
         where += " AND pr.product_id=?"
@@ -342,15 +375,18 @@ def next_prompt(product_id: int | None = None, job_id: int | None = None, peek: 
     if job_id is not None:
         where += " AND pr.job_id=?"
         params.append(job_id)
-    c = dbm.conn()
-    try:
-        c.execute("BEGIN IMMEDIATE")
+    return where, params
+
+
+@app.get("/api/next", dependencies=[Depends(auth)])
+def next_prompt(product_id: int | None = None, job_id: int | None = None, peek: bool = False):
+    """Entrega o prompt 'new' mais antigo e marca como 'used' (use peek=true para só olhar)."""
+    where, params = _filters(product_id, job_id)
+    with db() as c:
+        c.execute("SELECT pg_advisory_xact_lock(7003)")  # dois consumidores nunca recebem o mesmo prompt
         r = c.execute(f"{_PROMPT_SELECT} WHERE {where} ORDER BY pr.id LIMIT 1", params).fetchone()
         if r and not peek:
             c.execute("UPDATE prompts SET status='used', used_at=? WHERE id=?", (now(), r["id"]))
-        c.commit()
-    finally:
-        c.close()
     if not r:
         raise HTTPException(404, "nenhum prompt novo")
     return dict(r)
@@ -359,16 +395,9 @@ def next_prompt(product_id: int | None = None, job_id: int | None = None, peek: 
 @app.get("/api/next-batch", dependencies=[Depends(auth)])
 def next_batch(product_id: int | None = None, job_id: int | None = None, peek: bool = False):
     """Entrega o lote (ex.: os 3 prompts de 7s) mais antigo ainda 'new' e marca todos como 'used'."""
-    where, params = "pr.status='new'", []
-    if product_id is not None:
-        where += " AND pr.product_id=?"
-        params.append(product_id)
-    if job_id is not None:
-        where += " AND pr.job_id=?"
-        params.append(job_id)
-    c = dbm.conn()
-    try:
-        c.execute("BEGIN IMMEDIATE")
+    where, params = _filters(product_id, job_id)
+    with db() as c:
+        c.execute("SELECT pg_advisory_xact_lock(7003)")
         first = c.execute(f"{_PROMPT_SELECT} WHERE {where} ORDER BY pr.id LIMIT 1", params).fetchone()
         rows = []
         if first:
@@ -377,9 +406,6 @@ def next_batch(product_id: int | None = None, job_id: int | None = None, peek: b
             if not peek:
                 c.execute("UPDATE prompts SET status='used', used_at=? WHERE batch_id=? AND status='new'",
                           (now(), first["batch_id"]))
-        c.commit()
-    finally:
-        c.close()
     if not rows:
         raise HTTPException(404, "nenhum lote novo")
     rows = [dict(r) for r in rows]
