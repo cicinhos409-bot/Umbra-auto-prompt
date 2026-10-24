@@ -1,0 +1,9 @@
+services:
+  prompt-agent:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"   # exponha via Caddy/Nginx com HTTPS (veja README)
+    volumes:
+      - ./data:/data

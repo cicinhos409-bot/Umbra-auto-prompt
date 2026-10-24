@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prompt Agent</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--tx:#e7e9ee;--mut:#8b93a5;--ac:#6ee7b7;--ac2:#34d399;--bad:#f87171;--warn:#fbbf24}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5;flex-wrap:wrap}
+h1{font-size:16px;margin:0}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{background:none;border:0;color:var(--mut);padding:8px 12px;border-radius:8px;cursor:pointer;font:inherit}
+nav button.on{background:var(--card);color:var(--tx)}
+main{max-width:1100px;margin:0 auto;padding:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+label{display:block;color:var(--mut);font-size:12px;margin:8px 0 3px}
+input,textarea,select{width:100%;background:#0c0e12;border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:8px 10px;font:inherit}
+textarea{min-height:64px;resize:vertical}
+button.b{background:var(--ac);color:#04251a;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
+button.b:hover{background:var(--ac2)}
+button.g{background:#232836;color:var(--tx);border:0;border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit}
+button.d{background:none;color:var(--bad);border:0;cursor:pointer;font:inherit}
+.tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;background:#232836;color:var(--mut)}
+.tag.new{background:#0b3b2b;color:var(--ac)}.tag.used{background:#232836}.tag.discarded{background:#3b1d1d;color:var(--bad)}
+.mut{color:var(--mut)}.ok{color:var(--ac)}.err{color:var(--bad)}
+.prompt{border-top:1px solid var(--line);padding:10px 0;display:flex;gap:10px;justify-content:space-between}
+.prompt p{margin:4px 0 0;white-space:pre-wrap}
+.thumbs{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.thumbs div{position:relative}.thumbs img{height:64px;border-radius:6px;display:block}
+.thumbs button{position:absolute;top:-6px;right:-6px;border-radius:99px;border:0;background:var(--bad);color:#fff;width:18px;height:18px;cursor:pointer;line-height:1;font-size:11px}
+pre{background:#0c0e12;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-size:12.5px}
+.toast{position:fixed;bottom:16px;right:16px;background:var(--card);border:1px solid var(--line);padding:10px 14px;border-radius:10px;display:none;max-width:360px}
+#login{max-width:380px;margin:12vh auto;padding:0 20px}
+</style>
+</head>
+<body>
+<div id="login" style="display:none">
+  <div class="card"><h1>Prompt Agent</h1>
+    <label>API key (a do seu .env ou data/api_key.txt)</label>
+    <input id="key" type="password" placeholder="cole a chave" onkeydown="if(event.key==='Enter')saveKey()">
+    <div style="margin-top:12px"><button class="b" onclick="saveKey()">Entrar</button></div>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+<header><h1>⚡ Prompt Agent</h1>
+  <nav id="nav"></nav>
+  <span class="mut" id="health" style="margin-left:auto"></span>
+  <button class="g" onclick="logout()">sair</button>
+</header>
+<main id="main"></main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s, el=document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let KEY = localStorage.getItem('pa_key') || '';
+let tab = 'prompts', products = [], jobs = [];
+
+function toast(m, bad){const t=$('#toast');t.textContent=m;t.style.color=bad?'var(--bad)':'var(--tx)';t.style.display='block';clearTimeout(t._t);t._t=setTimeout(()=>t.style.display='none',3500)}
+async function api(path, opts={}){
+  opts.headers = Object.assign({'X-API-Key':KEY}, opts.headers||{});
+  if (opts.body && !(opts.body instanceof FormData)) { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
+  const r = await fetch(path, opts);
+  if (r.status === 401) { logout(); throw new Error('API key inválida'); }
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(data.detail || ('erro ' + r.status));
+  return data;
+}
+function saveKey(){KEY=$('#key').value.trim();localStorage.setItem('pa_key',KEY);boot()}
+function logout(){localStorage.removeItem('pa_key');KEY='';boot()}
+
+const TABS = {prompts:'Prompts', products:'Produtos', jobs:'Agentes', integ:'Integração', runs:'Histórico'};
+function renderNav(){ $('#nav').innerHTML = Object.entries(TABS).map(([k,v])=>`<button class="${tab===k?'on':''}" onclick="go('${k}')">${v}</button>`).join('') }
+async function go(t){ tab=t; renderNav(); await refresh(); }
+async function refresh(){
+  try{
+    [products, jobs] = await Promise.all([api('/api/products'), api('/api/jobs')]);
+    await ({prompts:vPrompts, products:vProducts, jobs:vJobs, integ:vInteg, runs:vRuns})[tab]();
+  }catch(e){ toast(e.message, true) }
+}
+async function boot(){
+  if(!KEY){ $('#login').style.display='block'; $('#app').style.display='none'; return }
+  $('#login').style.display='none'; $('#app').style.display='block';
+  try{ const h = await fetch('/api/health').then(r=>r.json());
+    $('#health').innerHTML = h.mock ? '<span class="err">modo MOCK (sem IA)</span>' : (h.has_anthropic_key ? '<span class="ok">IA conectada</span>' : '<span class="err">falta ANTHROPIC_API_KEY</span>'); }catch{}
+  renderNav(); await refresh();
+}
+
+// ---------- Prompts ----------
+let pf = {status:'new', product_id:''};
+async function vPrompts(){
+  const q = new URLSearchParams({limit:100}); if(pf.status) q.set('status',pf.status); if(pf.product_id) q.set('product_id',pf.product_id);
+  const list = await api('/api/prompts?'+q);
+  $('#main').innerHTML = `
+  <div class="card"><div class="row">
+    <select style="width:auto" onchange="pf.status=this.value;vPrompts()">${['new','used','discarded',''].map(s=>`<option value="${s}" ${pf.status===s?'selected':''}>${s||'todos'}</option>`).join('')}</select>
+    <select style="width:auto;max-width:340px" onchange="pf.product_id=this.value;vPrompts()"><option value="">todos os produtos</option>${products.map(p=>`<option value="${p.id}" ${String(pf.product_id)===String(p.id)?'selected':''}>${esc(p.name.slice(0,60))}</option>`).join('')}</select>
+    <span class="mut">${list.length} prompt(s)</span>
+    <span style="margin-left:auto"></span>
+    <select id="gp" style="width:auto;max-width:300px">${products.map(p=>`<option value="${p.id}">${esc(p.name.slice(0,50))}</option>`).join('')}</select>
+    <input id="gc" type="number" value="3" min="1" max="12" style="width:70px" title="quantidade">
+    <input id="gs" type="number" value="7" min="1" max="60" style="width:70px" title="segundos">
+    <select id="gm" style="width:auto"><option value="separate">separados</option><option value="sequence">sequência</option></select>
+    <button class="b" id="gb" onclick="genNow()">Gerar agora</button>
+  </div></div>
+  <div class="card">${list.length?list.map(p=>`
+    <div class="prompt"><div><span class="tag ${p.status}">${p.status}</span> <b>${esc(p.product_name.slice(0,70))}</b>
+      <span class="mut">· #${p.id} · lote ${p.batch_id||'-'} · ${p.idx}/${p.seconds}s · ${p.mode}</span><p>${esc(p.text)}</p></div>
+      <div class="row" style="align-self:flex-start;flex-wrap:nowrap">
+        <button class="g" onclick="copyP(${p.id})">copiar</button>
+        <button class="g" onclick="setSt(${p.id},'used')">usado</button>
+        <button class="g" onclick="setSt(${p.id},'discarded')">descartar</button></div></div>`).join(''):'<span class="mut">Nada por aqui ainda. Ligue um agente ou clique em “Gerar agora”.</span>'}</div>`;
+  window._pl = Object.fromEntries(list.map(p=>[p.id,p.text]));
+}
+function copyP(id){ navigator.clipboard.writeText(window._pl[id]); toast('copiado') }
+async function setSt(id,s){ await api('/api/prompts/'+id,{method:'PATCH',body:{status:s}}); vPrompts() }
+async function genNow(){
+  const b=$('#gb'); b.disabled=true; b.textContent='gerando…';
+  try{ await api('/api/generate',{method:'POST',body:{product_id:+$('#gp').value,count:+$('#gc').value,seconds:+$('#gs').value,mode:$('#gm').value}}); toast('prompts gerados'); pf.status='new'; await vPrompts() }
+  catch(e){ toast(e.message,true); b.disabled=false; b.textContent='Gerar agora' }
+}
+
+// ---------- Produtos ----------
+async function vProducts(){
+  $('#main').innerHTML = `<div class="row" style="margin-bottom:12px"><button class="b" onclick="editProduct()">+ Novo produto</button><span class="mut">${products.length} produto(s)</span></div>` +
+  products.map(p=>`<div class="card">
+    <div class="row"><b>${esc(p.name)}</b>${p.active?'':'<span class="tag">pausado</span>'}
+      <span class="mut" style="margin-left:auto">${p.prompts_new} novos · ${p.prompts_total} total</span>
+      <button class="g" onclick="editProduct(${p.id})">editar</button></div>
+    <div class="mut" style="margin-top:4px">${esc(p.description).slice(0,160)}</div>
+    <div class="thumbs">${p.images.map(i=>`<div><img src="/images/${i}"><button onclick="delImg(${p.id},'${i}')">×</button></div>`).join('')}
+      <label class="g" style="cursor:pointer;display:inline-flex;align-items:center;margin:0;padding:0 12px;border-radius:6px">+ imagem<input type="file" accept="image/*" hidden onchange="upImg(${p.id},this)"></label></div>
+  </div>`).join('');
+}
+function editProduct(id){
+  const p = products.find(x=>x.id===id) || {name:'',description:'',benefits:'',price:'',audience:'',notes:'',active:true};
+  const f = (k,l,ta)=>`<label>${l}</label>${ta?`<textarea id="p_${k}">${esc(p[k])}</textarea>`:`<input id="p_${k}" value="${esc(p[k])}">`}`;
+  $('#main').innerHTML = `<div class="card"><h3 style="margin-top:0">${id?'Editar':'Novo'} produto</h3>
+    ${f('name','Nome')}${f('description','Descrição',1)}${f('benefits','Benefícios / pontos de venda',1)}
+    <div class="grid">${['price','audience'].map(k=>`<div>${f(k,k==='price'?'Preço':'Público')}</div>`).join('')}</div>
+    ${f('notes','Observações (o que já vendeu bem, restrições, etc.)',1)}
+    <label><input type="checkbox" id="p_active" style="width:auto" ${p.active?'checked':''}> ativo (entra na rotação dos agentes)</label>
+    <div class="row" style="margin-top:12px"><button class="b" onclick="saveProduct(${id||0})">Salvar</button><button class="g" onclick="go('products')">cancelar</button>
+    ${id?`<button class="d" style="margin-left:auto" onclick="delProduct(${id})">excluir</button>`:''}</div>
+    <p class="mut">Depois de salvar, volte à lista para adicionar as imagens do produto — a IA enxerga as fotos ao escrever os prompts.</p></div>`;
+}
+async function saveProduct(id){
+  const body = {active:$('#p_active').checked}; for(const k of ['name','description','benefits','price','audience','notes']) body[k]=$('#p_'+k).value;
+  if(!body.name.trim()) return toast('nome é obrigatório',true);
+  try{ await api(id?'/api/products/'+id:'/api/products',{method:id?'PUT':'POST',body}); toast('salvo'); go('products') }catch(e){toast(e.message,true)}
+}
+async function delProduct(id){ if(confirm('Excluir produto e todos os prompts dele?')){ await api('/api/products/'+id,{method:'DELETE'}); go('products') } }
+async function upImg(id,inp){ const fd=new FormData(); fd.append('file',inp.files[0]); try{ await api(`/api/products/${id}/images`,{method:'POST',body:fd}); vProducts(); refresh() }catch(e){toast(e.message,true)} }
+async function delImg(id,n){ await api(`/api/products/${id}/images/${n}`,{method:'DELETE'}); refresh() }
+
+// ---------- Agentes ----------
+function fmtInt(s){ return s%3600===0?`${s/3600} h`:s%60===0?`${s/60} min`:`${s} s` }
+async function vJobs(){
+  $('#main').innerHTML = `<div class="row" style="margin-bottom:12px"><button class="b" onclick="editJob()">+ Novo agente</button></div>` +
+  jobs.map(j=>`<div class="card"><div class="row"><b>${esc(j.name)}</b>
+    <span class="tag ${j.enabled?'new':''}">${j.enabled?'ligado':'desligado'}</span>
+    <span class="mut">a cada ${fmtInt(j.interval_seconds)} · ${j.products_per_run} produto(s)/rodada · ${j.prompts_per_product} prompt(s) de ${j.seconds_each}s (${j.mode==='sequence'?'sequência':'separados'}) · ${j.product_ids.length?j.product_ids.length+' produtos':'todos os ativos'}</span>
+    <span style="margin-left:auto" class="row"><button class="g" onclick="runJob(${j.id})">rodar agora</button>
+    <button class="g" onclick="toggleJob(${j.id})">${j.enabled?'desligar':'ligar'}</button>
+    <button class="g" onclick="editJob(${j.id})">editar</button></span></div>
+    <div class="mut" style="margin-top:4px">última rodada: ${j.last_run||'nunca'}${j.webhook_url?' · webhook: '+esc(j.webhook_url.slice(0,50)):''}</div></div>`).join('')
+  || '<div class="card mut">Nenhum agente. Crie um para gerar prompts sozinho.</div>';
+}
+async function runJob(id){ await api(`/api/jobs/${id}/run`,{method:'POST'}); toast('rodando… veja em Prompts / Histórico') }
+async function toggleJob(id){ const j=jobs.find(x=>x.id===id); await api('/api/jobs/'+id,{method:'PUT',body:{...j,enabled:!j.enabled}}); refresh() }
+function editJob(id){
+  const j = jobs.find(x=>x.id===id) || {name:'Novo agente',enabled:false,interval_seconds:600,products_per_run:1,product_ids:[],prompts_per_product:3,seconds_each:7,mode:'separate',language:'en',target_tool:'',style:'',extra:'',max_backlog:30,webhook_url:'',webhook_auth:''};
+  const n=(k,l,extra='')=>`<div><label>${l}</label><input id="j_${k}" type="number" value="${j[k]}" ${extra}></div>`;
+  const t=(k,l,ph='')=>`<label>${l}</label><input id="j_${k}" value="${esc(j[k])}" placeholder="${ph}">`;
+  $('#main').innerHTML = `<div class="card"><h3 style="margin-top:0">${id?'Editar':'Novo'} agente</h3>
+    ${t('name','Nome')}
+    <div class="grid">${n('interval_seconds','Intervalo (segundos)','min=10')}${n('products_per_run','Produtos por rodada','min=1')}${n('prompts_per_product','Prompts por produto','min=1 max=12')}${n('seconds_each','Segundos por prompt','min=1 max=60')}${n('max_backlog','Parar se houver N prompts novos sem uso','min=1')}</div>
+    <div class="grid"><div><label>Modo</label><select id="j_mode"><option value="separate" ${j.mode==='separate'?'selected':''}>Separados (ideias diferentes)</option><option value="sequence" ${j.mode==='sequence'?'selected':''}>Sequência (cenas de um mesmo vídeo)</option></select></div>
+      <div><label>Idioma dos prompts</label><select id="j_language"><option value="en" ${j.language==='en'?'selected':''}>Inglês</option><option value="pt-br" ${j.language==='pt-br'?'selected':''}>Português</option></select></div></div>
+    ${t('target_tool','Ferramenta de destino (opcional)','ex.: Veo, Kling, Sora, Runway')}
+    ${t('style','Estilo visual (opcional)')}
+    <label>Instruções extras (opcional)</label><textarea id="j_extra">${esc(j.extra)}</textarea>
+    <label>Produtos (nada marcado = todos os ativos)</label>
+    <div style="max-height:200px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px">${products.map(p=>`<label style="margin:2px 0;color:var(--tx)"><input type="checkbox" class="jp" value="${p.id}" style="width:auto" ${j.product_ids.includes(p.id)?'checked':''}> ${esc(p.name.slice(0,80))}</label>`).join('')}</div>
+    ${t('webhook_url','Webhook (opcional) — recebe os prompts assim que são gerados','https://seu-sistema.com/receber')}
+    ${t('webhook_auth','Header Authorization do webhook (opcional)')}
+    <label><input type="checkbox" id="j_enabled" style="width:auto" ${j.enabled?'checked':''}> agente ligado</label>
+    <div class="row" style="margin-top:12px"><button class="b" onclick="saveJob(${id||0})">Salvar</button><button class="g" onclick="go('jobs')">cancelar</button>
+    ${id?`<button class="d" style="margin-left:auto" onclick="delJob(${id})">excluir</button>`:''}</div></div>`;
+}
+async function saveJob(id){
+  const body={enabled:$('#j_enabled').checked,mode:$('#j_mode').value,language:$('#j_language').value,
+    product_ids:[...document.querySelectorAll('.jp:checked')].map(x=>+x.value)};
+  for(const k of ['name','target_tool','style','extra','webhook_url','webhook_auth']) body[k]=$('#j_'+k).value;
+  for(const k of ['interval_seconds','products_per_run','prompts_per_product','seconds_each','max_backlog']) body[k]=+$('#j_'+k).value;
+  try{ await api(id?'/api/jobs/'+id:'/api/jobs',{method:id?'PUT':'POST',body}); toast('salvo'); go('jobs') }catch(e){toast(e.message,true)}
+}
+async function delJob(id){ if(confirm('Excluir agente?')){ await api('/api/jobs/'+id,{method:'DELETE'}); go('jobs') } }
+
+// ---------- Integração ----------
+async function vInteg(){
+  const o = location.origin;
+  $('#main').innerHTML = `<div class="card"><h3 style="margin-top:0">Como outro sistema pega os prompts</h3>
+  <p class="mut">Todas as chamadas levam o header <code>X-API-Key</code>. Cada chamada que “retira” prompts os marca como usados, então nada é entregue duas vezes.</p>
+  <b>Próximo prompt</b><pre>curl -H "X-API-Key: SUA_CHAVE" ${o}/api/next
+# opcional: ?product_id=3  ?job_id=1  ?peek=true (só olha, não marca como usado)</pre>
+  <b>Próximo lote inteiro (ex.: os 3 prompts de 7s do mesmo produto)</b><pre>curl -H "X-API-Key: SUA_CHAVE" ${o}/api/next-batch</pre>
+  <b>Gerar sob demanda</b><pre>curl -X POST -H "X-API-Key: SUA_CHAVE" -H "Content-Type: application/json" \\
+  -d '{"product_id":1,"count":3,"seconds":7,"mode":"separate"}' ${o}/api/generate</pre>
+  <b>Push automático</b><p class="mut">Em Agentes → editar, preencha o Webhook. A cada rodada o sistema envia um POST JSON com <code>event: "prompts.created"</code>, o produto, o <code>batch_id</code> e a lista de prompts.</p>
+  <b>Documentação completa (OpenAPI)</b><p><a style="color:var(--ac)" href="/docs" target="_blank">${o}/docs</a> — o arquivo <code>/openapi.json</code> pode ser usado em GPTs personalizados (Actions) e outras ferramentas.</p></div>`;
+}
+
+// ---------- Histórico ----------
+async function vRuns(){
+  const r = await api('/api/runs?limit=60'); const jn = Object.fromEntries(jobs.map(j=>[j.id,j.name]));
+  $('#main').innerHTML = `<div class="card">${r.length?r.map(x=>`<div class="prompt"><div><span class="${x.ok?'ok':'err'}">${x.ok?'✓':'✗'}</span> <b>${esc(jn[x.job_id]||('agente '+x.job_id))}</b> <span class="mut">· ${x.at} · ${x.count} prompt(s)</span><p class="${x.ok?'mut':'err'}">${esc(x.message)}</p></div></div>`).join(''):'<span class="mut">Nenhuma rodada ainda.</span>'}</div>`;
+}
+boot();
+</script>
+</body>
+</html>
